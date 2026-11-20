@@ -1,17 +1,8 @@
 import React, { Fragment, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { api } from "./api";
+import Tasks from "./Tasks";
 import "./style.css";
-
-async function api(path, method = "GET", body) {
-  const response = await fetch("/api/bots" + path, {
-    method, headers: body && { "Content-Type": "application/json" }, body: body && JSON.stringify(body),
-  });
-  if (!response.ok) {
-    const { detail } = await response.json().catch(() => ({}));
-    throw new Error(typeof detail === "string" ? detail : `请求失败（HTTP ${response.status}）`);
-  }
-  return response.json();
-}
 
 function Avatar({ bot }) {
   return <span className={"avatar tone-" + bot.id % 3} aria-hidden="true">{Array.from(bot.name)[0]}</span>;
@@ -29,7 +20,7 @@ function Profile({ bot, busy, setBusy, onSave, onCancel }) {
     setBusy(true);
     setError("");
     try {
-      onSave(await api(bot ? "/" + bot.id : "", bot ? "PUT" : "POST", values));
+      onSave(await api(bot ? "/bots/" + bot.id : "/bots", bot ? "PUT" : "POST", values));
     } catch (err) { setError(err.message); }
     finally { setBusy(false); }
   }
@@ -55,7 +46,7 @@ function Message({ name, text, mine }) {
 }
 
 function Chat({ bot, busy, setBusy, onEdit }) {
-  const path = "/" + bot.id + "/chat";
+  const path = "/bots/" + bot.id + "/chat";
   const [turns, setTurns] = useState(null);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
@@ -104,13 +95,19 @@ function App() {
   const [bots, setBots] = useState(null);
   const [selected, setSelected] = useState(null);
   const [editing, setEditing] = useState(false);
+  const [tasksOpen, setTasksOpen] = useState(location.hash === "#tasks");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const bot = bots?.find(item => item.id === selected);
-  function open(id) { setSelected(id); setEditing(false); }
+  useEffect(() => {
+    const followHash = () => setTasksOpen(location.hash === "#tasks");
+    window.addEventListener("hashchange", followHash);
+    return () => window.removeEventListener("hashchange", followHash);
+  }, []);
+  function open(id) { setSelected(id); setEditing(false); if (location.hash) location.hash = ""; }
   function load() {
     setError("");
-    api("").then(items => { setBots(items); open(items[0]?.id ?? null); }).catch(err => setError(err.message));
+    api("/bots").then(items => { setBots(items); setSelected(items[0]?.id ?? null); }).catch(err => setError(err.message));
   }
   useEffect(load, []);
   function saved(item) {
@@ -119,16 +116,19 @@ function App() {
   }
   return <div className="workspace">
     <aside><div className="brand"><span className="mark" aria-hidden="true">••</span>GrokBot</div>
+      <button className="task-link" disabled={busy} aria-current={tasksOpen ? "page" : undefined}
+        onClick={() => { location.hash = "tasks"; }}>任务</button>
       <div className="list-title"><h2>我的 Bot</h2><span>{bots?.length ?? "…"}</span></div>
       <button className="add" onClick={() => open(null)} disabled={busy || !bots}>＋ 创建 Bot</button>
       <nav aria-label="Bot 列表">{bots?.map(item => <button key={item.id} disabled={busy}
-        aria-current={selected === item.id ? "page" : undefined} onClick={() => open(item.id)}>
+        aria-current={!tasksOpen && selected === item.id ? "page" : undefined} onClick={() => open(item.id)}>
         <Avatar bot={item} /><span className="nav-copy"><strong>{item.name}</strong><small>{item.role}</small></span>
       </button>)}</nav>
     </aside>
     <main>{!bots ? <div className="profile">{error
       ? <p className="error" role="alert">{error} <button onClick={load}>重试</button></p>
       : <p>正在读取 Bot…</p>}</div>
+      : tasksOpen ? <Tasks bots={bots} />
       : bot && !editing ? <Chat key={bot.id} bot={bot} busy={busy} setBusy={setBusy} onEdit={() => setEditing(true)} />
       : <Profile key={selected ?? "new"} bot={bot} busy={busy} setBusy={setBusy} onSave={saved}
           onCancel={bots.length ? () => open(bot?.id ?? bots[0].id) : null} />}</main>

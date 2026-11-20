@@ -1,4 +1,4 @@
-# GrokBot · Stage 1
+# GrokBot
 
 在本地创建 Bot，编辑名称、角色和系统提示词，并与每个 Bot 单独聊天。
 
@@ -23,3 +23,13 @@
 ## 数据
 
 Bot 档案和各自的对话保存在 `data/grokbot.sqlite3`。模型调用成功后，一条提问和对应回答一起写入数据库。按 Ctrl+C 停止服务，再次运行启动脚本即可恢复档案和历史。
+
+## 任务
+
+在「任务」页填写任务描述，每行输入一条验收条件，再选择两个不同的 Bot。Engineer 提交结果后，Reviewer 逐条给出判断和证据。只有全部通过且阻塞问题列表为空时，任务才会完成。可以在「已保存的任务」中重新查看结果。[打开任务页](http://127.0.0.1:8000/#tasks)
+
+后端每次执行一个任务。每个 Bot 只读取自己的单聊记录。任务结果和评审单独保存在同一数据库的 `tasks` 表。模型出错、评审无效或进程中断时，任务停止。
+
+运行 `uv run --locked python -m unittest discover -s tests -v` 可验证任务流程。测试使用临时数据库和模拟模型回复。
+
+原群聊可独立启动。运行 `uv run --with streamlit==1.67.0 streamlit run app.py --server.address 127.0.0.1 --server.port 8501`。[打开群聊](http://127.0.0.1:8501)
