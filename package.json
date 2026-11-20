@@ -1,0 +1,8 @@
+{
+  "name": "grokbot",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": { "build": "vite build" },
+  "dependencies": { "react": "19.3.1", "react-dom": "19.3.1" },
+  "devDependencies": { "vite": "8.3.8" }
+}

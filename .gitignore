@@ -7,3 +7,6 @@ __pycache__/
 .streamlit/secrets.toml
 /group-data/
 /outputs/
+/data/
+/node_modules/
+/dist/
