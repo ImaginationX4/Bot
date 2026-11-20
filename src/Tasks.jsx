@@ -4,6 +4,7 @@ import { api } from "./api";
 const stages = {
   engineering: ["Engineer 正在执行", "进行中"], reviewing: ["Reviewer 正在验收", "进行中"],
   completed: ["评审结束", "已完成 · PASS"], failed: ["评审结束", "未通过 · FAIL"], error: ["已停止", "执行错误"],
+  NEEDS_HUMAN_REVIEW: ["两次评审结束", "需要人工复核 · NEEDS_HUMAN_REVIEW"],
 };
 
 function CreateTask({ bots, onCreated }) {
@@ -39,6 +40,19 @@ function CreateTask({ bots, onCreated }) {
   </form>;
 }
 
+function Attempt({ attempt, final }) {
+  const { number, engineer_output, run, review, invalid_review } = attempt;
+  return <section className="task-attempt" aria-label={`尝试 ${number}`}>
+    <h3>第 {number} 次尝试 · {number === 1 ? "初次执行" : "修复"}</h3>
+    <h4>Engineer 输出</h4><pre>{engineer_output ?? "等待 Engineer 输出"}</pre>
+    {run && <details><summary>测试结果 · {run.passed ? "PASS" : "FAIL"}</summary>
+      <pre>{[run.error, ...run.checks.map(c => `${c.passed ? "PASS" : "FAIL"} · ${c.test}\n${c.evidence}`),
+        run.output].filter(Boolean).join("\n\n")}</pre></details>}
+    <h4>{final ? "最终评审" : "Reviewer 反馈"}{review && " · " + review.verdict}</h4>
+    <pre>{review ? JSON.stringify(review, null, 2) : (invalid_review ?? "尚无评审")}</pre>
+  </section>;
+}
+
 function TaskDetail({ id, bots }) {
   const [task, setTask] = useState(null);
   const [error, setError] = useState("");
@@ -58,6 +72,7 @@ function TaskDetail({ id, bots }) {
     return () => { mounted = false; clearTimeout(timer); };
   }, [id, refresh]);
   const name = botId => bots.find(b => b.id === botId)?.name;
+  const attempts = task?.attempts ?? (task?.engineer_output ? [{ ...task, number: 1 }] : []);
   return <>
     {error && <p className="error" role="alert">{error} <button onClick={() => setRefresh(n => n + 1)}>刷新</button></p>}
     {task && <article className="task-detail">
@@ -65,8 +80,8 @@ function TaskDetail({ id, bots }) {
       <p>Engineer · {name(task.engineer_id)}　 Reviewer · {name(task.reviewer_id)}</p>
       <dl aria-live="polite"><dt>当前步骤</dt><dd>{stages[task.status][0]}</dd><dt>最终状态</dt><dd>{stages[task.status][1]}</dd></dl>
       <h3>验收条件</h3><ol>{task.criteria.map((c, i) => <li key={i}>{c}</li>)}</ol>
-      <h3>Engineer 输出</h3><pre>{task.engineer_output ?? "尚无输出"}</pre>
-      <h3>Reviewer 结果</h3><pre>{task.review ? JSON.stringify(task.review, null, 2) : (task.invalid_review ?? "尚无评审")}</pre>
+      {attempts.map((attempt, i) => <Attempt key={attempt.number} attempt={attempt}
+        final={!["engineering", "reviewing"].includes(task.status) && i === attempts.length - 1} />)}
       {task.error && <p className="error" role="alert">{task.error}</p>}
     </article>}
   </>;
@@ -85,9 +100,10 @@ export default function Tasks({ bots }) {
   return <section className="tasks">
     <header><h1>任务</h1>{id !== "" && <button onClick={() => select("")}>新建任务</button>}</header>
     {error && <p className="error" role="alert">{error} <button onClick={load}>重试</button></p>}
-    {items?.length > 0 && <label>已保存的任务<select value={id} onChange={e => select(e.target.value)}>
+    {items?.length > 0 && <div className="field"><label htmlFor="saved-task">已保存的任务</label>
+      <select id="saved-task" value={id} onChange={e => select(e.target.value)}>
       <option value="">新建任务</option>{items.map(t => <option key={t.id} value={t.id}>#{t.id} · {t.description}</option>)}
-    </select></label>}
+    </select></div>}
     {items && (id === "" ? <CreateTask bots={bots} onCreated={created} /> : <TaskDetail key={id} id={id} bots={bots} />)}
   </section>;
 }
