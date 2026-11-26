@@ -1,5 +1,6 @@
 import json
 import os
+from uuid import uuid4
 from pathlib import Path
 
 import streamlit as st
@@ -69,9 +70,54 @@ def show_files(task_id):
 
 if selected is not None:
     st.title(f"Private chat · {names[selected]}")
-    for sender, body in room.private_history(selected):
+    history = room.private_messages(selected)
+    end_key = f"handoff_end_{selected}"
+    draft_key = f"handoff_draft_{selected}"
+    for msg_id, sender, body in history:
         with st.chat_message(sender):
             st.markdown(body)
+        if st.button(f"交给 {names[selected]} 执行", key=f"handoff_{msg_id}"):
+            st.session_state[end_key] = msg_id
+            st.session_state.pop(draft_key, None)
+            st.session_state.pop(f"first_{msg_id}", None)
+    last = st.session_state.get(end_key)
+    if last is not None:
+        candidates = {i: (sender, body) for i, sender, body in history if i <= last}
+        first = st.selectbox("从哪条消息开始", list(candidates), index=len(candidates)-1, key=f"first_{last}",
+                             format_func=lambda i: f"#{i} {candidates[i][1][:50]}")
+        st.caption(f"选中范围 #{first} – #{last}")
+        for i, (sender, body) in candidates.items():
+            if i >= first:
+                st.text(f"{names[selected] if sender == 'assistant' else '你'}：{body}")
+        if st.button("生成任务草稿"):
+            try:
+                draft = room.draft_card(selected, first, last)
+                st.session_state[draft_key] = (first, last, uuid4().hex, draft)
+            except (OSError, ValueError, RuntimeError) as error:
+                st.error(str(error))
+        saved = st.session_state.get(draft_key)
+        if saved and saved[:2] == (first, last):
+            _, _, token, draft = saved
+            with st.form(f"card_{token}"):
+                deliverable = st.text_area("交付物", draft["deliverable"], key=f"output_{token}")
+                criteria = st.text_area("完成条件", draft["criteria"], key=f"criteria_{token}")
+                command = st.text_input("验收命令（可选）", key=f"check_{token}")
+                if st.form_submit_button("开始"):
+                    try:
+                        room.start_card(selected, deliverable, criteria, command, token)
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        del st.session_state[draft_key], st.session_state[end_key]
+                        st.rerun()
+    for task_id, status, card, outcome in room.deliveries(selected):
+        st.subheader(f"任务 #{task_id} · " + {"awaiting_confirmation": "待确认"}.get(status, status))
+        st.text(card)
+        st.write(outcome)
+        show_files(task_id)
+        if status == "awaiting_confirmation" and st.button("接受", key=f"accept_{task_id}"):
+            room.accept_delivery(selected, task_id)
+            st.rerun()
     with st.expander("派任务"):
         with st.form(f"dispatch_{selected}"):
             description = st.text_area("任务说明")
@@ -175,7 +221,9 @@ def chat():
         else:
             with st.chat_message("user" if kind == "Task" else name):
                 st.caption(f"{name} · {kind}")
-                if kind == "Stopped":
+                if kind == "Task acceptance":
+                    st.code(body, language=None)
+                elif kind == "Stopped":
                     st.error(body)
                 else:
                     st.markdown(body)
@@ -213,16 +261,18 @@ def chat():
             limit = None
         else:
             limit = st.number_input("Maximum rounds", min_value=1, value=3)
+    final_command = None
     executor = reviewer = planner = None
     if not active and not pending and command is None:
         names = {i: name for i, name, _ in room.members()}
+        final_command = st.text_input("Acceptance command after final review (optional)")
         planner = st.selectbox("Planner (optional)", [None, *names],
                                format_func=lambda i: "Use executor" if i is None else names[i])
         executor = st.selectbox("Executor", list(names), format_func=names.get)
         reviewer = st.selectbox("Reviewer", [i for i in names if i != executor], format_func=names.get)
     task = st.chat_input("Give the group a task", disabled=bool(active or pending))
     if task:
-        submit(lambda value: room.start(value, command, limit, total_seconds, executor_id=executor, reviewer_id=reviewer, planner_id=planner), task)
+        submit(lambda value: room.start(value, command, limit, total_seconds, executor_id=executor, reviewer_id=reviewer, planner_id=planner, final_command=final_command), task)
 
 
 chat()

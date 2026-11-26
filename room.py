@@ -155,6 +155,9 @@ class Room:
         with self.db:
             self.db.execute("""UPDATE group_tasks SET status='failed' WHERE status='running'
                 AND id IN (SELECT task_id FROM solo_cards)""")
+        self.db.execute("CREATE TABLE IF NOT EXISTS final_checks (task_id INTEGER PRIMARY KEY, command TEXT NOT NULL)")
+        for (task_id,) in self.db.execute("SELECT id FROM group_tasks WHERE status='checking'").fetchall():
+            self.finish_check(task_id, False, "Acceptance interrupted before its result was saved.")
         self.pending()
         last = self.db.execute("SELECT kind FROM messages ORDER BY rowid DESC LIMIT 1").fetchone()
         if not self.db.execute("SELECT 1 FROM group_tasks").fetchone() and last and last[0] not in ("Final result", "Stopped"):
@@ -179,6 +182,11 @@ class Room:
     def members(self):
         with self.lock:
             return self.db.execute("SELECT id,name,role FROM people ORDER BY id").fetchall()
+
+    def private_messages(self, agent_id):
+        with self.lock:
+            return self.db.execute("""SELECT id,sender,body FROM private_messages
+                WHERE agent_id=? ORDER BY id""", (agent_id,)).fetchall()
 
     def private_history(self, agent_id):
         with self.lock:
@@ -206,6 +214,22 @@ class Room:
             with self.lock, self.db:
                 self.db.execute("INSERT INTO private_messages(agent_id,sender,body) VALUES (?,'assistant',?)",
                                 (agent_id, reply))
+
+    def draft_card(self, agent_id, first, last):
+        rows = [row for row in self.private_messages(agent_id) if first <= row[0] <= last]
+        if not rows or rows[0][0] != first or rows[-1][0] != last:
+            raise ValueError("请选择本会话中的消息范围。")
+        prompt = ("仅根据以下消息生成任务卡，保留商定的步骤和文件名。只输出 JSON 对象，"
+                  "deliverable 和 criteria 均为非空字符串。\n"
+                  + json.dumps([row[1:] for row in rows], ensure_ascii=False))
+        with TemporaryDirectory() as folder:
+            result = run_turn(folder, "plan", prompt, lambda _: None,
+                              env={**os.environ, "OPENCODE_CONFIG_CONTENT": '{"permission":{"*":"deny"}}'})
+        draft = json.loads(result)
+        if not isinstance(draft, dict) or not all(isinstance(draft.get(k), str) and draft[k].strip()
+                                                  for k in ("deliverable", "criteria")):
+            raise ValueError("草稿缺少交付物或完成条件，请重新生成。")
+        return draft
 
     def plan_team(self, goal, planner, candidates, reference=None, dependent=False, revise=False, final=False):
         revise = revise or final
@@ -481,6 +505,17 @@ class Room:
                 self.db.execute("UPDATE solo_cards SET outcome=? WHERE task_id=?", (outcome, task_id))
         return task_id
 
+    def deliveries(self, agent_id):
+        with self.lock:
+            return self.db.execute("""SELECT t.id,t.status,m.body,c.outcome FROM solo_cards c
+                JOIN group_tasks t ON t.id=c.task_id JOIN messages m ON m.rowid=t.id
+                WHERE c.agent_id=? ORDER BY t.id DESC""", (agent_id,)).fetchall()
+
+    def accept_delivery(self, agent_id, task_id):
+        with self.lock, self.db:
+            self.db.execute("""UPDATE group_tasks SET status='completed' WHERE id=? AND status='awaiting_confirmation'
+                AND id IN (SELECT task_id FROM solo_cards WHERE agent_id=?)""", (task_id, agent_id))
+
     def add_member(self, member):
         name, role = (field.strip() for field in member)
         with self.lock, self.db:
@@ -518,7 +553,8 @@ class Room:
             row = self.db.execute("""SELECT t.id, t.status, COALESCE(r.next_step, COUNT(s.step)), r.deadline
                 FROM group_tasks t LEFT JOIN group_steps s ON s.task_id=t.id
                 LEFT JOIN ralph_tasks r ON r.task_id=t.id
-                WHERE t.status NOT IN ('completed','failed','cancelled') AND NOT EXISTS (SELECT 1 FROM solo_cards WHERE task_id=t.id) GROUP BY t.id ORDER BY t.id LIMIT 1""").fetchone()
+                WHERE t.status NOT IN ('completed','failed','cancelled')
+                AND NOT EXISTS (SELECT 1 FROM solo_cards WHERE task_id=t.id) GROUP BY t.id ORDER BY t.id LIMIT 1""").fetchone()
 
             if row and not self.active and row[3] is not None and time.time() >= row[3]:
                 self.expire(row[0])
@@ -532,7 +568,7 @@ class Room:
                 LEFT JOIN acceptance a ON a.task_id=t.id
                 WHERE t.id=(SELECT MAX(id) FROM group_tasks) ORDER BY a.round DESC LIMIT 1""").fetchone()
 
-    def start(self, task, command=None, max_rounds=3, total_seconds=3600, *, executor_id=None, reviewer_id=None, from_private=False, planner_id=None):
+    def start(self, task, command=None, max_rounds=3, total_seconds=3600, *, executor_id=None, reviewer_id=None, from_private=False, planner_id=None, final_command=None):
         if command is not None and (not command.strip() or (max_rounds is not None and max_rounds < 1)):
             raise ValueError("Enter an acceptance command and at least one round.")
         if command is not None and total_seconds is not None and not (0 < total_seconds < float("inf")):
@@ -548,6 +584,10 @@ class Room:
                 task_id = self.db.execute("INSERT INTO messages VALUES ('You','Task',?)", (task.strip(),)).lastrowid
                 self.db.execute("INSERT INTO group_tasks VALUES (?, 'ready')", (task_id,))
                 self.db.execute("INSERT INTO task_members(task_id,executor_id,reviewer_id,planner_id) VALUES (?,?,?,?)", (task_id, *ids))
+                if final_command and final_command.strip():
+                    if command is not None:
+                        raise ValueError("Choose one acceptance mode.")
+                    self.db.execute("INSERT INTO final_checks VALUES (?,?)", (task_id, final_command.strip()))
                 if from_private:
                     self.db.execute("INSERT INTO private_dispatch VALUES (?,?)", (task_id, ids[0]))
                 if command is not None:
@@ -626,7 +666,10 @@ class Room:
                 next_step = step + 1
             if ralph:
                 self.db.execute("UPDATE ralph_tasks SET next_step=? WHERE task_id=?", (next_step, task_id))
-            status = "completed" if step + 1 == len(STEPS) else "ready"
+            status = "ready"
+            if step + 1 == len(STEPS):
+                if not self.db.execute("SELECT 1 FROM final_checks WHERE task_id=?", (task_id,)).fetchone():
+                    status = "completed"
             self.db.execute("UPDATE group_tasks SET status=? WHERE id=?", (status, task_id))
 
     def save_acceptance(self, task_id, number, limit, passed, output, timed_out=False):
@@ -646,11 +689,34 @@ class Room:
 
     def run_acceptance(self, task_id, deadline):
         with self.lock:
-            command, number, limit = self.db.execute(
-                "SELECT command,round,max_rounds FROM ralph_tasks WHERE task_id=?", (task_id,)).fetchone()
-            self.active = f"Acceptance · Round {number}"
-        passed, output, timed_out = self.execute_check(command, deadline)
-        self.save_acceptance(task_id, number, limit, passed, output, timed_out)
+            final = self.db.execute("SELECT command FROM final_checks WHERE task_id=?", (task_id,)).fetchone()
+            if final:
+                command = final[0]
+                self.active = "Acceptance"
+                with self.db:
+                    self.db.execute("UPDATE group_tasks SET status='checking' WHERE id=?", (task_id,))
+            else:
+                command, number, limit = self.db.execute(
+                    "SELECT command,round,max_rounds FROM ralph_tasks WHERE task_id=?", (task_id,)).fetchone()
+                self.active = f"Acceptance · Round {number}"
+        try:
+            passed, output, timed_out = self.execute_check(command, deadline)
+        except OSError as error:
+            if not final:
+                raise
+            passed, output, timed_out = False, str(error), False
+        if final:
+            self.finish_check(task_id, passed, output)
+        else:
+            self.save_acceptance(task_id, number, limit, passed, output, timed_out)
+
+    def finish_check(self, task_id, passed, output):
+        status = "completed" if passed else "failed"
+        with self.lock, self.db:
+            self.db.execute("INSERT INTO acceptance VALUES (?,1,?,?)", (task_id, passed, output))
+            self.db.execute("UPDATE group_tasks SET status=? WHERE id=?", (status, task_id))
+            self.db.execute("INSERT INTO messages VALUES ('Bot','Task acceptance',?)",
+                            (f"Task #{task_id} · {status}\n{output}",))
 
     def execute_check(self, command, deadline, folder=None):
         remaining(deadline)
