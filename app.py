@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -54,6 +55,18 @@ with st.sidebar:
     if st.button("Open work folder"):
         os.startfile(room.work)
 
+def show_files(task_id):
+    for path in room.solo_files(task_id):
+        label = str(path.relative_to(room.solo_folder(task_id)))
+        data = path.read_bytes()
+        with st.expander(label):
+            try:
+                st.code(data.decode("utf-8"), language=None)
+            except UnicodeDecodeError:
+                st.caption(f"{len(data)} bytes")
+            st.download_button("下载", data, file_name=path.name, key=f"file_{task_id}_{label}")
+
+
 if selected is not None:
     st.title(f"Private chat · {names[selected]}")
     for sender, body in room.private_history(selected):
@@ -87,6 +100,55 @@ if selected is not None:
     st.stop()
 
 st.title("Group chat")
+
+
+with st.expander("分工任务"):
+    with st.form("plan_team"):
+        goal = st.text_area("总目标")
+        planner = st.selectbox("规划者", list(names), format_func=names.get)
+        candidates = st.multiselect("可用成员", list(names), format_func=names.get)
+        dependent = st.checkbox("第二步需要第一步的交付物")
+        revise = st.checkbox("自动审阅并修订一次（含交付物交接）")
+        upload = st.file_uploader("参考文件（可选）", type=["txt", "md"])
+        if st.form_submit_button("生成分工计划"):
+            try:
+                room.plan_team(goal, planner, candidates, (upload.name, upload.getvalue()) if upload else None, dependent=dependent, revise=revise)
+            except (ValueError, RuntimeError, OSError) as error:
+                st.error(str(error))
+    for parent, goal, planner, raw in room.team_plans():
+        st.subheader(f"分工任务 #{parent} · {goal}")
+        st.caption(f"规划者：{names[planner]}")
+        children = []
+        blocked = False
+        for position, card in enumerate(json.loads(raw), 1):
+            child = room.team_child(parent, position)
+            children.append(child)
+            owner = names[card["owner_id"]]
+            st.write(f"{position}. {owner} · {card['description']}")
+            st.text(f"交付物：{card['deliverable']}\n完成条件：{card['criteria']}")
+            if card.get("inputs"):
+                st.write("依赖第一步交付物：" + "、".join(card["inputs"]))
+                if not child and children[0]:
+                    _, reason = room.team_inputs(parent, card["inputs"])
+                    if reason:
+                        st.error("第二步未启动：" + reason)
+                        blocked = True
+            st.caption(child[1] if child else ("已阻止" if blocked else "待派单"))
+            if child:
+                st.write(child[2])
+                show_files(child[0])
+        if card.get("revise"):
+            st.caption("审阅报告交付后自动交回原执行者修订一次")
+            revision = room.team_child(parent, 3)
+            if revision:
+                st.write(f"修订版 · {revision[1]}")
+                show_files(revision[0])
+                st.write("执行者逐条回复")
+                st.text(revision[2])
+            elif all(children) and children[1][1] != "failed":
+                children.append(None)
+        if not blocked and not all(children) and st.button("开始", key=f"team_{parent}"):
+            submit(room.start_team, parent)
 
 
 @st.fragment(run_every=1)

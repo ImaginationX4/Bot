@@ -104,6 +104,7 @@ class Room:
         self.work.mkdir(parents=True, exist_ok=True)
         self.lock = RLock()
         self.private_locks = {}
+        self.dispatch_lock = Lock()
         self.active = ""
         self.stopping = False
         self.process = None
@@ -138,6 +139,20 @@ class Room:
             PRIMARY KEY(task_id, round))""")
         if "deadline" not in {row[1] for row in self.db.execute("PRAGMA table_info(ralph_tasks)")}:
             self.db.execute("ALTER TABLE ralph_tasks ADD COLUMN deadline REAL")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS team_plans (
+            id INTEGER PRIMARY KEY, goal TEXT NOT NULL, planner INTEGER NOT NULL, cards TEXT NOT NULL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS team_reference (
+            parent_id INTEGER PRIMARY KEY, name TEXT NOT NULL, content BLOB NOT NULL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS card_input (
+            task_id INTEGER PRIMARY KEY, path TEXT NOT NULL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS handoff_inputs (
+            task_id INTEGER, path TEXT, PRIMARY KEY(task_id,path))""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS solo_cards (
+            task_id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL, request_id TEXT UNIQUE NOT NULL,
+            outcome TEXT NOT NULL DEFAULT '')""")
+        with self.db:
+            self.db.execute("""UPDATE group_tasks SET status='failed' WHERE status='running'
+                AND id IN (SELECT task_id FROM solo_cards)""")
         self.pending()
         last = self.db.execute("SELECT kind FROM messages ORDER BY rowid DESC LIMIT 1").fetchone()
         if not self.db.execute("SELECT 1 FROM group_tasks").fetchone() and last and last[0] not in ("Final result", "Stopped"):
@@ -190,6 +205,218 @@ class Room:
                 self.db.execute("INSERT INTO private_messages(agent_id,sender,body) VALUES (?,'assistant',?)",
                                 (agent_id, reply))
 
+    def plan_team(self, goal, planner, candidates, reference=None, dependent=False, revise=False):
+        dependent = dependent or revise
+        if reference is not None:
+            name, _ = reference
+            if (Path(name).name != name or Path(name).suffix.lower() not in (".txt", ".md")
+                    or any(c in '<>:"/\\|?*' or ord(c) < 32 for c in name)
+                    or Path(name).is_reserved()):
+                raise ValueError("请选择一个 .txt 或 .md 文件。")
+        members = {i: {"id": i, "name": name, "role": role} for i, name, role in self.members()}
+        if not goal.strip() or planner not in members or not candidates or not set(candidates) <= members.keys():
+            raise ValueError("请填写总目标并选择规划者和可用成员。")
+        context = {"goal": goal.strip(), "planner": members[planner], "candidates": [members[i] for i in candidates]}
+        prompt = ("你是指定的规划者。根据目标和候选成员职责，自行分配两个串行子任务。仅返回 JSON 数组。"
+                  "每项含整数 owner_id，以及非空字符串 description、deliverable、criteria。\n"
+                  + json.dumps(context, ensure_ascii=False))
+        if dependent:
+            prompt = ("第二步需要第一步的交付文件。第一张卡在交付物中明确列出要创建的文件名；"
+                      "第二张卡增加 inputs 字段，列出它需要读取的第一步产物的工作目录相对路径（JSON 字符串数组）。" + prompt)
+        if revise:
+            prompt = "第二步审阅第一步原件，写出完整审阅报告，逐项列出问题、依据和修改建议。" + prompt
+        with TemporaryDirectory() as folder:
+            raw = run_turn(folder, "plan", prompt, lambda _: None,
+                           env={**os.environ, "OPENCODE_CONFIG_CONTENT": '{"permission":{"*":"deny"}}'})
+        cards = json.loads(raw)
+        if not isinstance(cards, list) or len(cards) != 2:
+            raise ValueError("计划必须包含两个子任务。")
+        for card in cards:
+            if (not isinstance(card, dict) or type(card.get("owner_id")) is not int
+                    or card["owner_id"] not in candidates):
+                raise ValueError("计划中的负责人必须在候选名单内。")
+            if not all(isinstance(card.get(k), str) and card[k].strip()
+                       for k in ("description", "deliverable", "criteria")):
+                raise ValueError("每项分工都需要任务说明、交付物和完成条件。")
+        for card in cards:
+            card.pop("revise", None)
+        if revise:
+            cards[1]["revise"] = True
+        cards[0].pop("inputs", None)
+        if dependent:
+            paths = cards[1].get("inputs")
+            if not isinstance(paths, list) or not paths:
+                raise ValueError("计划必须指定第二步需要的第一步交付文件。")
+            for path in paths:
+                if (not isinstance(path, str) or not path or Path(path).as_posix() != path
+                        or Path(path).anchor or ".." in Path(path).parts
+                        or any(ch in '<>:"|?*' or ord(ch) < 32 for ch in path)):
+                    raise ValueError("交接文件必须使用工作目录内的相对路径。")
+            cards[1]["inputs"] = list(dict.fromkeys(paths))
+        else:
+            cards[1].pop("inputs", None)
+        with self.lock, self.db:
+            parent = self.db.execute("INSERT INTO team_plans(goal,planner,cards) VALUES (?,?,?)",
+                                   (goal.strip(), planner, json.dumps(cards, ensure_ascii=False))).lastrowid
+            if reference is not None:
+                self.db.execute("INSERT INTO team_reference VALUES (?,?,?)", (parent, *reference))
+            return parent
+
+    def team_plans(self):
+        with self.lock:
+            return self.db.execute("SELECT id,goal,planner,cards FROM team_plans ORDER BY id DESC").fetchall()
+
+    def team_child(self, parent, position):
+        with self.lock:
+            return self.db.execute("""SELECT c.task_id,t.status,c.outcome FROM solo_cards c
+                JOIN group_tasks t ON c.task_id=t.id WHERE c.request_id=?""",
+                                   (f"team:{parent}:{position}",)).fetchone()
+
+    def team_inputs(self, parent, required):
+        first = self.team_child(parent, 1)
+        if not first:
+            return [], "第一步尚未开始"
+        task_id, status, outcome = first
+        if status == "failed":
+            return [], f"第一步失败：{outcome}"
+        if status not in ("awaiting_confirmation", "completed"):
+            return [], "第一步尚未交付"
+        folder = self.solo_folder(task_id)
+        outputs = {p.relative_to(folder).as_posix(): p for p in self.solo_files(task_id)}
+        missing = [name for name in required if name not in outputs]
+        if missing:
+            return [], "第一步缺少指定交付物：" + "、".join(missing)
+        return [(name, outputs[name]) for name in required], ""
+
+    def start_team(self, parent):
+        if not self.dispatch_lock.acquire(blocking=False):
+            raise ValueError("已有分工任务正在派单。")
+        try:
+            with self.lock:
+                reference = self.db.execute("SELECT name,content FROM team_reference WHERE parent_id=?", (parent,)).fetchone()
+                row = self.db.execute("SELECT cards FROM team_plans WHERE id=?", (parent,)).fetchone()
+            if not row:
+                raise ValueError("找不到该分工任务。")
+            cards = json.loads(row[0])
+            for position, card in enumerate(cards, 1):
+                inputs = []
+                if card.get("inputs"):
+                    if self.team_child(parent, position):
+                        continue
+                    inputs, reason = self.team_inputs(parent, card["inputs"])
+                    if reason:
+                        return
+                criteria = card["criteria"]
+                if card.get("revise"):
+                    criteria += "\n读取交接的原件，将完整审阅报告写入文件，每条列出问题、依据和修改建议。"
+                self.start_card(card["owner_id"], card["deliverable"], criteria, "",
+                                f"team:{parent}:{position}", description=card["description"], reference=reference, inputs=inputs)
+            if cards[1].get("revise"):
+                self.revise_team(parent, cards[0], reference)
+        finally:
+            self.dispatch_lock.release()
+
+    def revise_team(self, parent, original_card, reference):
+        original = self.team_child(parent, 1)
+        review = self.team_child(parent, 2)
+        if not review or review[1] not in ("completed", "awaiting_confirmation") or self.team_child(parent, 3):
+            return
+        inputs = []
+        expected = []
+        for child, category in ((original, "original"), (review, "review")):
+            folder = self.solo_folder(child[0])
+            for file in self.solo_files(child[0]):
+                name = file.relative_to(folder).as_posix()
+                inputs.append((f"{category}/{name}", file))
+                if category == "original":
+                    expected.append(name)
+        if not expected or not any(name.startswith("review/") for name, _ in inputs):
+            raise ValueError("缺少原件或审阅报告，无法修订。")
+        description = ("原任务卡：" + json.dumps(original_card, ensure_ascii=False)
+                       + "\n审阅者回复：" + review[2]
+                       + "\n阅读完整审阅报告、原件和参考资料。逐条将建议中的每个断言与资料原文对照，报告本身不作为证据。只有资料支持整个建议时才修改。"
+                       + "一次观察只能支持该次现象，不能证明频率、唯一性或普遍规律。证据不足时保留原文，说明证据边界，不加入推测。")
+        self.start_card(original_card["owner_id"], "在工作目录中按原相对路径输出修订版：" + "、".join(expected),
+                        "最终回复按审阅报告顺序逐条写“已修改”或“保留原文”，说明依据。保留其他内容。", "",
+                        f"team:{parent}:3", description=description, reference=reference, inputs=inputs,
+                        revision_files=expected)
+
+    def solo_folder(self, task_id):
+        return self.work.parent / "deliveries" / str(task_id)
+
+    def solo_files(self, task_id):
+        folder = self.solo_folder(task_id)
+        with self.lock:
+            row = self.db.execute("SELECT path FROM card_input WHERE task_id=?", (task_id,)).fetchone()
+            sources = {folder / name for name, in self.db.execute("SELECT path FROM handoff_inputs WHERE task_id=?", (task_id,))}
+        if row:
+            sources.add(folder / row[0])
+        return sorted(p for p in folder.rglob("*") if p not in sources and p.is_file() and p.resolve().is_relative_to(folder.resolve())
+                      and ".git" not in p.relative_to(folder).parts)
+
+    def start_card(self, agent_id, deliverable, criteria, command, request_id, *, description=None, reference=None, inputs=(), revision_files=()):
+        if not deliverable.strip() or not criteria.strip():
+            raise ValueError("请填写交付物和完成条件。")
+        card = f"交付物\n{deliverable.strip()}\n\n完成条件\n{criteria.strip()}"
+        if description:
+            card = f"任务说明\n{description}\n\n{card}"
+        with self.lock, self.db:
+            existing = self.db.execute("SELECT task_id FROM solo_cards WHERE request_id=?", (request_id,)).fetchone()
+            if existing:
+                return existing[0]
+            member = self.db.execute("SELECT name,role FROM people WHERE id=?", (agent_id,)).fetchone()
+            if not member or self.active or self.pending():
+                raise ValueError("请选择已有成员，并等待当前任务结束。")
+            task_id = self.db.execute("INSERT INTO messages VALUES ('You','Task',?)", (card,)).lastrowid
+            self.db.execute("INSERT INTO group_tasks VALUES (?,'running')", (task_id,))
+            self.db.execute("INSERT INTO solo_cards(task_id,agent_id,request_id) VALUES (?,?,?)",
+                            (task_id, agent_id, request_id))
+            if reference is not None:
+                relative = Path("reference", reference[0]).as_posix()
+                self.db.execute("INSERT INTO card_input VALUES (?,?)", (task_id, relative))
+            self.db.executemany("INSERT INTO handoff_inputs VALUES (?,?)",
+                                [(task_id, f"inputs/{name}") for name, _ in inputs])
+            self.active = f"{member[0]} · Work"
+        folder = self.solo_folder(task_id)
+        status, outcome = "failed", "执行中断。"
+        try:
+            folder.mkdir(parents=True)
+            prompt = f"You are {member[0]}. {member[1]}. Execute this task card:\n{card}"
+            if reference is not None:
+                (folder / "reference").mkdir()
+                (folder / relative).write_bytes(reference[1])
+                prompt += f"\n\n参考文件（相对当前工作目录）：{relative}"
+            for name, source in inputs:
+                relative_input = f"inputs/{name}"
+                target = folder / relative_input
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+                label = "修订输入" if revision_files else "第一步交付物"
+                prompt += f"\n{label}（相对当前工作目录）：{relative_input}"
+            outcome = run_turn(folder, "build", prompt, lambda _: None)
+            if revision_files:
+                outputs = {p.relative_to(folder).as_posix() for p in self.solo_files(task_id)}
+                missing = set(revision_files) - outputs
+                status = "failed" if missing else "completed"
+                if missing:
+                    outcome += "\n缺少修订版：" + "、".join(sorted(missing))
+            elif command.strip():
+                passed, output, _ = self.execute_check(command.strip(), None, folder)
+                status = "completed" if passed else "failed"
+                outcome += "\n" + output
+            elif self.solo_files(task_id):
+                status = "awaiting_confirmation"
+            else:
+                status, outcome = "failed", outcome + "\n工作目录中没有交付文件。"
+        except Exception as error:
+            status, outcome = "failed", str(error)
+        finally:
+            with self.lock, self.db:
+                self.active = ""
+                self.db.execute("UPDATE group_tasks SET status=? WHERE id=?", (status, task_id))
+                self.db.execute("UPDATE solo_cards SET outcome=? WHERE task_id=?", (outcome, task_id))
+        return task_id
+
     def add_member(self, member):
         name, role = (field.strip() for field in member)
         with self.lock, self.db:
@@ -227,7 +454,7 @@ class Room:
             row = self.db.execute("""SELECT t.id, t.status, COALESCE(r.next_step, COUNT(s.step)), r.deadline
                 FROM group_tasks t LEFT JOIN group_steps s ON s.task_id=t.id
                 LEFT JOIN ralph_tasks r ON r.task_id=t.id
-                WHERE t.status NOT IN ('completed','failed','cancelled') GROUP BY t.id ORDER BY t.id LIMIT 1""").fetchone()
+                WHERE t.status NOT IN ('completed','failed','cancelled') AND NOT EXISTS (SELECT 1 FROM solo_cards WHERE task_id=t.id) GROUP BY t.id ORDER BY t.id LIMIT 1""").fetchone()
 
             if row and not self.active and row[3] is not None and time.time() >= row[3]:
                 self.expire(row[0])
@@ -358,8 +585,12 @@ class Room:
             command, number, limit = self.db.execute(
                 "SELECT command,round,max_rounds FROM ralph_tasks WHERE task_id=?", (task_id,)).fetchone()
             self.active = f"Acceptance · Round {number}"
+        passed, output, timed_out = self.execute_check(command, deadline)
+        self.save_acceptance(task_id, number, limit, passed, output, timed_out)
+
+    def execute_check(self, command, deadline, folder=None):
         remaining(deadline)
-        with self.spawn(command, shell=True, cwd=self.work, stdin=subprocess.DEVNULL,
+        with self.spawn(command, shell=True, cwd=folder or self.work, stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               errors="replace", start_new_session=os.name != "nt") as process:
             try:
@@ -369,11 +600,10 @@ class Room:
                 output, _ = process.communicate()
                 remaining(deadline)
                 reason = f"Acceptance timed out after {ACCEPTANCE_TIMEOUT_SECONDS} s."
-                self.save_acceptance(task_id, number, limit, False, f"{reason}\n{output}", timed_out=True)
-                return
+                return False, f"{reason}\n{output}", True
         remaining(deadline)
         output = f"Exit code {process.returncode}\n{output}"
-        self.save_acceptance(task_id, number, limit, process.returncode == 0, output)
+        return process.returncode == 0, output, False
 
     def run(self, people, task_id, first):
         try:
