@@ -141,6 +141,8 @@ class Room:
             self.db.execute("ALTER TABLE ralph_tasks ADD COLUMN deadline REAL")
         self.db.execute("""CREATE TABLE IF NOT EXISTS team_plans (
             id INTEGER PRIMARY KEY, goal TEXT NOT NULL, planner INTEGER NOT NULL, cards TEXT NOT NULL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS team_verdict (
+            parent_id INTEGER PRIMARY KEY, status TEXT NOT NULL, detail TEXT NOT NULL)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS team_reference (
             parent_id INTEGER PRIMARY KEY, name TEXT NOT NULL, content BLOB NOT NULL)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS card_input (
@@ -205,7 +207,8 @@ class Room:
                 self.db.execute("INSERT INTO private_messages(agent_id,sender,body) VALUES (?,'assistant',?)",
                                 (agent_id, reply))
 
-    def plan_team(self, goal, planner, candidates, reference=None, dependent=False, revise=False):
+    def plan_team(self, goal, planner, candidates, reference=None, dependent=False, revise=False, final=False):
+        revise = revise or final
         dependent = dependent or revise
         if reference is not None:
             name, _ = reference
@@ -216,8 +219,11 @@ class Room:
         members = {i: {"id": i, "name": name, "role": role} for i, name, role in self.members()}
         if not goal.strip() or planner not in members or not candidates or not set(candidates) <= members.keys():
             raise ValueError("请填写总目标并选择规划者和可用成员。")
+        if final and (len(set(candidates)) != 3 or planner in candidates):
+            raise ValueError("最终验收需要规划者以外的三名候选成员。")
+        stages = "开发、测试、最终验收三张卡，分别交给三名不同候选人；验收使用开发修订后的文件" if final else "两个串行子任务"
         context = {"goal": goal.strip(), "planner": members[planner], "candidates": [members[i] for i in candidates]}
-        prompt = ("你是指定的规划者。根据目标和候选成员职责，自行分配两个串行子任务。仅返回 JSON 数组。"
+        prompt = ("你是指定的规划者。根据目标和候选成员职责，自行分配" + stages + "。仅返回 JSON 数组。"
                   "每项含整数 owner_id，以及非空字符串 description、deliverable、criteria。\n"
                   + json.dumps(context, ensure_ascii=False))
         if dependent:
@@ -229,8 +235,8 @@ class Room:
             raw = run_turn(folder, "plan", prompt, lambda _: None,
                            env={**os.environ, "OPENCODE_CONFIG_CONTENT": '{"permission":{"*":"deny"}}'})
         cards = json.loads(raw)
-        if not isinstance(cards, list) or len(cards) != 2:
-            raise ValueError("计划必须包含两个子任务。")
+        if not isinstance(cards, list) or len(cards) != (3 if final else 2):
+            raise ValueError("任务卡数量与所选流程不符。")
         for card in cards:
             if (not isinstance(card, dict) or type(card.get("owner_id")) is not int
                     or card["owner_id"] not in candidates):
@@ -240,6 +246,10 @@ class Room:
                 raise ValueError("每项分工都需要任务说明、交付物和完成条件。")
         for card in cards:
             card.pop("revise", None)
+        if final:
+            if len({c["owner_id"] for c in cards}) != 3:
+                raise ValueError("开发、测试、最终验收必须分给不同成员。")
+            cards[2].pop("inputs", None)
         if revise:
             cards[1]["revise"] = True
         cards[0].pop("inputs", None)
@@ -258,6 +268,8 @@ class Room:
         with self.lock, self.db:
             parent = self.db.execute("INSERT INTO team_plans(goal,planner,cards) VALUES (?,?,?)",
                                    (goal.strip(), planner, json.dumps(cards, ensure_ascii=False))).lastrowid
+            if final:
+                self.db.execute("INSERT INTO team_verdict VALUES (?, '待验收', '')", (parent,))
             if reference is not None:
                 self.db.execute("INSERT INTO team_reference VALUES (?,?,?)", (parent, *reference))
             return parent
@@ -294,17 +306,21 @@ class Room:
         try:
             with self.lock:
                 reference = self.db.execute("SELECT name,content FROM team_reference WHERE parent_id=?", (parent,)).fetchone()
-                row = self.db.execute("SELECT cards FROM team_plans WHERE id=?", (parent,)).fetchone()
+                row = self.db.execute("SELECT cards,goal FROM team_plans WHERE id=?", (parent,)).fetchone()
             if not row:
                 raise ValueError("找不到该分工任务。")
             cards = json.loads(row[0])
-            for position, card in enumerate(cards, 1):
+            for position, card in enumerate(cards[:2], 1):
                 inputs = []
                 if card.get("inputs"):
                     if self.team_child(parent, position):
                         continue
                     inputs, reason = self.team_inputs(parent, card["inputs"])
                     if reason:
+                        if len(cards) == 3:
+                            with self.lock, self.db:
+                                self.db.execute("UPDATE team_verdict SET status='验收失败',detail=? WHERE parent_id=?",
+                                                (reason, parent))
                         return
                 criteria = card["criteria"]
                 if card.get("revise"):
@@ -313,6 +329,8 @@ class Room:
                                 f"team:{parent}:{position}", description=card["description"], reference=reference, inputs=inputs)
             if cards[1].get("revise"):
                 self.revise_team(parent, cards[0], reference)
+            if len(cards) == 3:
+                self.accept_team(parent, row[1], cards[2])
         finally:
             self.dispatch_lock.release()
 
@@ -340,6 +358,52 @@ class Room:
                         "最终回复按审阅报告顺序逐条写“已修改”或“保留原文”，说明依据。保留其他内容。", "",
                         f"team:{parent}:3", description=description, reference=reference, inputs=inputs,
                         revision_files=expected)
+
+    def team_verdict(self, parent):
+        with self.lock:
+            return self.db.execute("SELECT status,detail FROM team_verdict WHERE parent_id=?", (parent,)).fetchone()
+
+    def accept_team(self, parent, goal, card):
+        if self.team_verdict(parent)[0] != "待验收":
+            return
+        revision = self.team_child(parent, 3)
+        try:
+            if not revision or revision[1] != "completed":
+                raise ValueError("开发修订阶段没有成功交付。")
+            folder = self.solo_folder(revision[0])
+            inputs = [(p.relative_to(folder).as_posix(), p) for p in self.solo_files(revision[0])]
+            criteria = (card["criteria"] + "\n根据原始目标独立设计用例，实际执行 inputs/ 中的修订版。"
+                        "不要修改被测文件。记录真实命令和结果，同时写 acceptance.json，格式为非空 JSON 数组。"
+                        "每项含字符串 input、command、expected、actual（后两项为输出文本），整数 exit_code、"
+                        "expected_exit_code，以及布尔值 passed。错误路径用例可预期非零退出码。")
+            tid = self.start_card(card["owner_id"], card["deliverable"], criteria, "", f"team:{parent}:4",
+                                  description=f"原始目标：{goal}\n{card['description']}", inputs=inputs)
+            check_folder = self.solo_folder(tid)
+            child = self.team_child(parent, 4)
+            if child[1] != "awaiting_confirmation":
+                raise ValueError(child[2])
+            report = check_folder / "acceptance.json"
+            if report not in self.solo_files(tid):
+                raise ValueError("缺少 acceptance.json")
+            results = json.loads(report.read_text(encoding="utf-8-sig"))
+            if not isinstance(results, list) or not results:
+                raise ValueError("没有验收用例")
+            for n, case in enumerate(results, 1):
+                if (not isinstance(case, dict) or not all(isinstance(case.get(k), str)
+                        for k in ("input", "command", "expected", "actual"))
+                        or type(case.get("expected_exit_code")) is not int or type(case.get("exit_code")) is not int
+                        or case.get("passed") is not True or case["expected"].strip() != case["actual"].strip()
+                        or case["exit_code"] != case["expected_exit_code"]):
+                    raise ValueError(f"验收用例 {n} 未通过或记录不完整。")
+            status, detail = "验收通过", f"{len(results)} 项通过"
+        except (ValueError, OSError) as error:
+            status, detail = "验收失败", str(error)
+        with self.lock, self.db:
+            self.db.execute("UPDATE team_verdict SET status=?, detail=? WHERE parent_id=?", (status, detail, parent))
+            child = self.team_child(parent, 4)
+            if child:
+                self.db.execute("UPDATE group_tasks SET status=? WHERE id=?",
+                                ("completed" if status == "验收通过" else "failed", child[0]))
 
     def solo_folder(self, task_id):
         return self.work.parent / "deliveries" / str(task_id)

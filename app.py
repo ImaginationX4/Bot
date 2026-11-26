@@ -109,10 +109,11 @@ with st.expander("分工任务"):
         candidates = st.multiselect("可用成员", list(names), format_func=names.get)
         dependent = st.checkbox("第二步需要第一步的交付物")
         revise = st.checkbox("自动审阅并修订一次（含交付物交接）")
+        final = st.checkbox("四成员最终验收（含测试和修订）")
         upload = st.file_uploader("参考文件（可选）", type=["txt", "md"])
         if st.form_submit_button("生成分工计划"):
             try:
-                room.plan_team(goal, planner, candidates, (upload.name, upload.getvalue()) if upload else None, dependent=dependent, revise=revise)
+                room.plan_team(goal, planner, candidates, (upload.name, upload.getvalue()) if upload else None, dependent=dependent, revise=revise, final=final)
             except (ValueError, RuntimeError, OSError) as error:
                 st.error(str(error))
     for parent, goal, planner, raw in room.team_plans():
@@ -120,7 +121,8 @@ with st.expander("分工任务"):
         st.caption(f"规划者：{names[planner]}")
         children = []
         blocked = False
-        for position, card in enumerate(json.loads(raw), 1):
+        cards = json.loads(raw)
+        for position, card in enumerate(cards[:2], 1):
             child = room.team_child(parent, position)
             children.append(child)
             owner = names[card["owner_id"]]
@@ -146,6 +148,17 @@ with st.expander("分工任务"):
                 st.write("执行者逐条回复")
                 st.text(revision[2])
             elif all(children) and children[1][1] != "failed":
+                children.append(None)
+        if len(cards) == 3:
+            acceptance = cards[2]
+            st.write(f"最终验收 · {names[acceptance['owner_id']]} · {acceptance['description']}")
+            st.text(f"交付物：{acceptance['deliverable']}\n完成条件：{acceptance['criteria']}")
+            status, detail = room.team_verdict(parent)
+            st.write(f"父任务：{status} {detail}")
+            child = room.team_child(parent, 4)
+            if child:
+                show_files(child[0])
+            if status == "待验收":
                 children.append(None)
         if not blocked and not all(children) and st.button("开始", key=f"team_{parent}"):
             submit(room.start_team, parent)

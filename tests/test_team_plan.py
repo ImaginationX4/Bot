@@ -247,3 +247,55 @@ class TeamPlan(unittest.TestCase):
                 self.assertEqual([f.read_bytes() for f in room.solo_files(last)], [b"new"])
             finally:
                 room.db.close()
+
+    def test_final_acceptance_catches_wrong_revision(self):
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as tmp:
+            room = Room(Path(tmp))
+            room.create([("A","规划"),("B","开发")])
+            room.add_member(("C","测试"))
+            room.add_member(("D","独立验收"))
+            cards = [dict(owner_id=i, description=role, deliverable=file, criteria="实测") for i,role,file in
+                     [(2,"开发","count_lines.py"),(3,"测试","review.md"),(4,"验收","acceptance.json")]]
+            cards[1]["inputs"] = ["count_lines.py"]
+            calls = []
+            good = b"import sys\nfrom pathlib import Path\nprint(len(Path(sys.argv[1]).read_bytes().splitlines()))\n"
+            bad = good.replace(b"splitlines()))", b"splitlines()) or 1)")
+            def run_empty(folder, script):
+                (folder/"empty.txt").write_bytes(b"")
+                return subprocess.run([sys.executable, "-S", str(script), "empty.txt"], cwd=folder,
+                                      capture_output=True, text=True, check=True)
+            def fake(folder, mode, prompt, show_tool, **kwargs):
+                if mode == "plan":
+                    self.assertIn("最终验收", prompt)
+                    calls.append("A")
+                    return json.dumps(cards)
+                actor = prompt.split(".")[0][-1]
+                calls.append(actor)
+                if actor == "B":
+                    (folder/"count_lines.py").write_bytes(bad if calls.count("B")==2 else good)
+                else:
+                    script = folder/"inputs/count_lines.py"
+                    expected_bytes = good if actor=="C" else bad
+                    self.assertEqual(script.read_bytes(), expected_bytes)
+                    record = run_empty(folder, script)
+                    actual = record.stdout.strip()
+                    self.assertEqual(actual, "0" if actor=="C" else "1")
+                    if actor=="C":
+                        (folder/"review.md").write_text("Empty input passed")
+                    else:
+                        self.assertIn("原始目标：行数统计",prompt)
+                        (folder/"acceptance.json").write_text(json.dumps([dict(input="empty",
+                            command="python inputs/count_lines.py empty.txt", expected="0", actual=actual,
+                            expected_exit_code=0, exit_code=record.returncode, passed=True)]))
+                return "done"
+            try:
+                with patch("room.run_turn",fake):
+                    parent=room.plan_team("行数统计",1,[2,3,4],final=True)
+                    room.start_team(parent)
+                    room.start_team(parent)
+                self.assertEqual(calls,["A","B","C","B","D"])
+                self.assertEqual(room.team_verdict(parent)[0],"验收失败")
+            finally:
+                room.db.close()
