@@ -39,13 +39,52 @@ if not people:
     st.stop()
 
 with st.sidebar:
+    names = {i: name for i, name, _ in room.members()}
+    selected = st.selectbox("Conversation", [None, *names],
+                            format_func=lambda i: "Group chat" if i is None else names[i])
     st.header("Group members")
-    for (name, role), job in zip(people, ("Task owner", "Reviewer")):
+    for name, role in people:
         st.subheader(name)
-        st.caption(job)
         st.text(role)
+    with st.form("add_member", clear_on_submit=True):
+        name = st.text_input("New member name", max_chars=60)
+        role = st.text_area("New member role")
+        if st.form_submit_button("Add member"):
+            submit(room.add_member, (name, role))
     if st.button("Open work folder"):
         os.startfile(room.work)
+
+if selected is not None:
+    st.title(f"Private chat · {names[selected]}")
+    for sender, body in room.private_history(selected):
+        with st.chat_message(sender):
+            st.markdown(body)
+    with st.expander("派任务"):
+        with st.form(f"dispatch_{selected}"):
+            description = st.text_area("任务说明")
+            reviewer = st.selectbox("审阅者", [i for i in names if i != selected], format_func=names.get)
+            if st.form_submit_button("确认提交"):
+                try:
+                    room.start(description, executor_id=selected, reviewer_id=reviewer, from_private=True)
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    st.rerun()
+    for task_id, status, description in room.dispatched_tasks(selected):
+        with st.expander(f"查看任务 #{task_id} · {status}"):
+            st.write(description)
+            for name, phase, output in room.task_outputs(task_id):
+                st.caption(f"{name} · {phase}")
+                st.markdown(output)
+    message = st.chat_input("Send a private message", key=f"private_{selected}")
+    if message:
+        try:
+            room.private_chat(selected, message)
+        except (ValueError, RuntimeError, OSError) as error:
+            st.error(str(error))
+        else:
+            st.rerun()
+    st.stop()
 
 st.title("Group chat")
 
@@ -99,9 +138,14 @@ def chat():
             limit = None
         else:
             limit = st.number_input("Maximum rounds", min_value=1, value=3)
+    executor = reviewer = None
+    if not active and not pending and command is None:
+        names = {i: name for i, name, _ in room.members()}
+        executor = st.selectbox("Executor", list(names), format_func=names.get)
+        reviewer = st.selectbox("Reviewer", [i for i in names if i != executor], format_func=names.get)
     task = st.chat_input("Give the group a task", disabled=bool(active or pending))
     if task:
-        submit(lambda value: room.start(value, command, limit, total_seconds), task)
+        submit(lambda value: room.start(value, command, limit, total_seconds, executor_id=executor, reviewer_id=reviewer), task)
 
 
 chat()
