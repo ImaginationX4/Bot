@@ -208,9 +208,9 @@ class TaskFlow(unittest.TestCase):
             try:
                 people = [("Alice", "Owner"), ("Bob", "Reviewer")]
                 group.create(people)
-                group.post("You", "Task", "Write a greeting")
                 with patch("room.run_turn", return_value="Hello") as model:
-                    group.run(people)
+                    with patch("room.Thread.start", lambda thread: thread.run()):
+                        group.start("Write a greeting")
                 self.assertEqual([m[1] for m in group.snapshot()[1]], ["Task", "Proposal", "Reply", "Work", "Final result"])
                 self.assertEqual(model.call_count, 4)
             finally:

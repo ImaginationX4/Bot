@@ -65,11 +65,43 @@ def chat():
                     st.error(body)
                 else:
                     st.markdown(body)
+    progress = room.ralph_progress()
+    if progress:
+        number, limit, status, tested, passed, output = progress
+        st.caption(f"Ralph · Round {number} of {limit or 'unlimited'} · {status}")
+        if tested is not None:
+            st.write(f"Latest acceptance · Round {tested} · {'Passed' if passed else 'Failed'}")
+            st.code(output, language=None)
     if active:
         st.status(active, state="running")
-    task = st.chat_input("Give the group a task", disabled=bool(active))
+    pending = room.pending()
+    if active and progress and pending and st.button("Stop", key=f"stop_{pending[0]}"):
+        submit(room.stop, pending[0])
+    if pending and not active:
+        task_id, status, step = pending
+        retry = False
+        if status == "running":
+            st.warning(f"Step {step + 1} may have changed the work folder. Check it before retrying.")
+            retry = st.checkbox(f"I checked the work folder and want to rerun step {step + 1}.",
+                                key=f"retry_{task_id}_{step}")
+        if st.button("Resume", disabled=status == "running" and not retry):
+            submit(lambda value: room.resume(value, retry), task_id)
+    command = None
+    total_seconds = 3600
+    limit = 3
+    if not active and not pending and st.checkbox("Ralph mode"):
+        command = st.text_input("Acceptance command (runs in the work folder)")
+        if st.checkbox("No total time limit"):
+            total_seconds = None
+        else:
+            total_seconds = st.number_input("Total time limit (seconds)", min_value=1, value=3600)
+        if st.checkbox("No round limit"):
+            limit = None
+        else:
+            limit = st.number_input("Maximum rounds", min_value=1, value=3)
+    task = st.chat_input("Give the group a task", disabled=bool(active or pending))
     if task:
-        submit(room.start, task)
+        submit(lambda value: room.start(value, command, limit, total_seconds), task)
 
 
 chat()

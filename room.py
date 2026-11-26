@@ -1,9 +1,15 @@
 import json
+import os
+import signal
 import shutil
 import sqlite3
 import subprocess
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock, Thread, Timer
+
+ACCEPTANCE_TIMEOUT_SECONDS = 600
 
 STEPS = (
     (0, "Proposal", "plan", "Propose a short approach for the other member to check. Use no tools yet."),
@@ -13,16 +19,46 @@ STEPS = (
 )
 
 
-def run_turn(folder, agent, prompt, show_tool):
+class TaskCancelled(Exception):
+    pass
+
+
+class DeadlineExpired(Exception):
+    def __init__(self):
+        super().__init__("Ralph task total time limit expired.")
+
+
+def remaining(deadline):
+    if deadline is None:
+        return float("inf")
+    seconds = deadline - time.time()
+    if seconds <= 0:
+        raise DeadlineExpired()
+    return seconds
+
+
+def terminate_tree(process):
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def run_turn(folder, agent, prompt, show_tool, deadline=None, spawn=None):
     command = shutil.which("opencode")
     if not command:
         raise RuntimeError("Install OpenCode and add it to PATH.")
     native = Path(command).parent / "node_modules/opencode-ai/bin/opencode.exe"
     args = [str(native) if native.is_file() else command, "run", "--format", "json", "--agent", agent]
-    with subprocess.Popen(args, cwd=folder, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    remaining(deadline)
+    with (spawn or subprocess.Popen)(args, cwd=folder, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as process:
-        timer = Timer(600, process.kill)
+                          start_new_session=os.name != "nt", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as process:
+        delay = 600 if deadline is None else max(0, min(600, deadline - time.time()))
+        timer = Timer(delay, terminate_tree, args=(process,))
         timer.start()
         replies, failure, diagnostic, finish = [], "", "", ""
         try:
@@ -51,8 +87,10 @@ def run_turn(folder, agent, prompt, show_tool):
             code = process.wait()
         finally:
             timer.cancel()
+            timer.join()
             if process.poll() is None:
                 process.kill()
+    remaining(deadline)
     reply = "\n\n".join(replies).strip()
     if failure or code or finish != "stop" or not reply:
         raise RuntimeError(failure or diagnostic or f"OpenCode stopped before it finished (exit {code}, reason {finish}).")
@@ -65,11 +103,28 @@ class Room:
         self.work.mkdir(parents=True, exist_ok=True)
         self.lock = RLock()
         self.active = ""
+        self.stopping = False
+        self.process = None
+        self.worker = None
         self.db = sqlite3.connect(folder / "group.db", check_same_thread=False)
         self.db.execute("CREATE TABLE IF NOT EXISTS people (name TEXT, role TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS messages (name TEXT, kind TEXT, body TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS group_tasks (id INTEGER PRIMARY KEY, status TEXT NOT NULL)")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS group_steps (
+            task_id INTEGER, step INTEGER, output_message INTEGER NOT NULL, PRIMARY KEY(task_id, step))""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS ralph_tasks (
+            task_id INTEGER PRIMARY KEY, command TEXT NOT NULL, max_rounds INTEGER NOT NULL,
+            round INTEGER NOT NULL DEFAULT 1, next_step INTEGER NOT NULL DEFAULT 0)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS ralph_work (
+            task_id INTEGER, round INTEGER, output_message INTEGER NOT NULL, PRIMARY KEY(task_id, round))""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS acceptance (
+            task_id INTEGER, round INTEGER, passed INTEGER NOT NULL, output TEXT NOT NULL,
+            PRIMARY KEY(task_id, round))""")
+        if "deadline" not in {row[1] for row in self.db.execute("PRAGMA table_info(ralph_tasks)")}:
+            self.db.execute("ALTER TABLE ralph_tasks ADD COLUMN deadline REAL")
+        self.pending()
         last = self.db.execute("SELECT kind FROM messages ORDER BY rowid DESC LIMIT 1").fetchone()
-        if last and last[0] not in ("Final result", "Stopped"):
+        if not self.db.execute("SELECT 1 FROM group_tasks").fetchone() and last and last[0] not in ("Final result", "Stopped"):
             self.post("Group", "Stopped", "The app closed during this task. Check the work folder before you continue.")
 
     def snapshot(self):
@@ -92,30 +147,190 @@ class Room:
         with self.lock, self.db:
             self.db.execute("INSERT INTO messages VALUES (?, ?, ?)", (name, kind, body))
 
-    def start(self, task):
+    def expire(self, task_id):
+        with self.lock, self.db:
+            self.db.execute("UPDATE group_tasks SET status='failed' WHERE id=?", (task_id,))
+            self.db.execute("INSERT INTO messages VALUES ('Bot','Stopped',?)", (str(DeadlineExpired()),))
+
+    def pending(self):
+        with self.lock:
+            row = self.db.execute("""SELECT t.id, t.status, COALESCE(r.next_step, COUNT(s.step)), r.deadline
+                FROM group_tasks t LEFT JOIN group_steps s ON s.task_id=t.id
+                LEFT JOIN ralph_tasks r ON r.task_id=t.id
+                WHERE t.status NOT IN ('completed','failed','cancelled') GROUP BY t.id ORDER BY t.id LIMIT 1""").fetchone()
+
+            if row and not self.active and row[3] is not None and time.time() >= row[3]:
+                self.expire(row[0])
+                return None
+            return row[:3] if row else None
+
+    def ralph_progress(self):
+        with self.lock:
+            return self.db.execute("""SELECT r.round, r.max_rounds, t.status, a.round, a.passed, a.output
+                FROM group_tasks t JOIN ralph_tasks r ON r.task_id=t.id
+                LEFT JOIN acceptance a ON a.task_id=t.id
+                WHERE t.id=(SELECT MAX(id) FROM group_tasks) ORDER BY a.round DESC LIMIT 1""").fetchone()
+
+    def start(self, task, command=None, max_rounds=3, total_seconds=3600):
+        if command is not None and (not command.strip() or (max_rounds is not None and max_rounds < 1)):
+            raise ValueError("Enter an acceptance command and at least one round.")
+        if command is not None and total_seconds is not None and not (0 < total_seconds < float("inf")):
+            raise ValueError("Enter a positive total time limit.")
         with self.lock:
             people, _, active = self.snapshot()
-            if active or len(people) != 2 or not task.strip():
-                raise ValueError("Create the group and wait for the current task to finish before you send a task.")
-            self.post("You", "Task", task.strip())
-            self.active = f"{people[0][0]} · Proposal"
-            Thread(target=self.run, args=(people,), daemon=True).start()
+            if active or self.pending() or len(people) != 2 or not task.strip():
+                raise ValueError("Create the group and finish the current task before sending another.")
+            with self.db:
+                task_id = self.db.execute("INSERT INTO messages VALUES ('You','Task',?)", (task.strip(),)).lastrowid
+                self.db.execute("INSERT INTO group_tasks VALUES (?, 'ready')", (task_id,))
+                if command is not None:
+                    deadline = None if total_seconds is None else time.time() + total_seconds
+                    self.db.execute("INSERT INTO ralph_tasks(task_id,command,max_rounds,deadline) VALUES (?,?,?,?)",
+                                    (task_id, command, max_rounds or 0, deadline))
+            self.launch(people, task_id, 0)
 
-    def run(self, people):
+    def resume(self, task_id, retry=False):
+        with self.lock:
+            pending = self.pending()
+            if self.active or not pending or pending[0] != task_id:
+                raise ValueError("This task is no longer waiting to resume.")
+            if pending[1] == "running" and not retry:
+                raise ValueError("Check the work folder before retrying this step.")
+            self.launch(self.snapshot()[0], task_id, pending[2])
+
+    def launch(self, people, task_id, first):
+        self.active = "Acceptance" if first == 4 else STEPS[first][1]
+        self.worker = Thread(target=self.run, args=(people, task_id, first), daemon=True)
+        self.worker.start()
+
+    def check_stop(self):
+        if self.stopping:
+            raise TaskCancelled()
+
+    @contextmanager
+    def spawn(self, *args, **kwargs):
+        with self.lock:
+            self.check_stop()
+            process = self.process = subprocess.Popen(*args, **kwargs)
         try:
-            for index, phase, agent, instruction in STEPS:
+            with process:
+                yield process
+        finally:
+            with self.lock:
+                self.process = None
+
+    def stop(self, task_id):
+        with self.lock:
+            pending = self.pending()
+            if not self.active or not pending or pending[0] != task_id or not self.ralph_progress():
+                raise ValueError("This Ralph task is no longer running.")
+            self.stopping = True
+            if self.process is not None:
+                terminate_tree(self.process)
+            worker = self.worker
+        worker.join()
+
+    def save_step(self, task_id, step, name, phase, reply):
+        with self.lock, self.db:
+            self.check_stop()
+            message = self.db.execute("INSERT INTO messages VALUES (?, ?, ?)", (name, phase, reply)).lastrowid
+            ralph = self.db.execute("SELECT round FROM ralph_tasks WHERE task_id=?", (task_id,)).fetchone()
+            if ralph and step == 2:
+                self.db.execute("INSERT INTO ralph_work VALUES (?,?,?)", (task_id, ralph[0], message))
+                next_step = 4  # Run acceptance after this round's saved Work.
+            else:
+                self.db.execute("INSERT INTO group_steps VALUES (?, ?, ?)", (task_id, step, message))
+                next_step = step + 1
+            if ralph:
+                self.db.execute("UPDATE ralph_tasks SET next_step=? WHERE task_id=?", (next_step, task_id))
+            status = "completed" if step + 1 == len(STEPS) else "ready"
+            self.db.execute("UPDATE group_tasks SET status=? WHERE id=?", (status, task_id))
+
+    def save_acceptance(self, task_id, number, limit, passed, output, timed_out=False):
+        with self.lock, self.db:
+            self.check_stop()
+            self.db.execute("INSERT INTO acceptance VALUES (?,?,?,?)", (task_id, number, passed, output))
+            # Zero represents unlimited rounds in the existing NOT NULL column.
+            exhausted = timed_out or (not passed and 0 < limit <= number)
+            next_round = number if passed or exhausted else number + 1
+            self.db.execute("UPDATE ralph_tasks SET round=?,next_step=? WHERE task_id=?",
+                            (next_round, 3 if passed else 2, task_id))
+            self.db.execute("UPDATE group_tasks SET status=? WHERE id=?",
+                            ("failed" if exhausted else "ready", task_id))
+            verdict = "Passed" if passed else "Failed"
+            self.db.execute("INSERT INTO messages VALUES ('Bot','Acceptance',?)",
+                            (f"Round {number}: {verdict}\n{output}",))
+
+    def run_acceptance(self, task_id, deadline):
+        with self.lock:
+            command, number, limit = self.db.execute(
+                "SELECT command,round,max_rounds FROM ralph_tasks WHERE task_id=?", (task_id,)).fetchone()
+            self.active = f"Acceptance · Round {number}"
+        remaining(deadline)
+        with self.spawn(command, shell=True, cwd=self.work, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                              errors="replace", start_new_session=os.name != "nt") as process:
+            try:
+                output, _ = process.communicate(timeout=min(ACCEPTANCE_TIMEOUT_SECONDS, remaining(deadline)))
+            except (subprocess.TimeoutExpired, DeadlineExpired):
+                terminate_tree(process)
+                output, _ = process.communicate()
+                remaining(deadline)
+                reason = f"Acceptance timed out after {ACCEPTANCE_TIMEOUT_SECONDS} s."
+                self.save_acceptance(task_id, number, limit, False, f"{reason}\n{output}", timed_out=True)
+                return
+        remaining(deadline)
+        output = f"Exit code {process.returncode}\n{output}"
+        self.save_acceptance(task_id, number, limit, process.returncode == 0, output)
+
+    def run(self, people, task_id, first):
+        try:
+            step = first
+            with self.lock:
+                row = self.db.execute("SELECT deadline FROM ralph_tasks WHERE task_id=?", (task_id,)).fetchone()
+            deadline = row[0] if row else None
+            while True:
+                remaining(deadline)
+                if step == 4:
+                    self.run_acceptance(task_id, deadline)
+                    pending = self.pending()
+                    if not pending:
+                        break
+                    step = pending[2]
+                    continue
+                index, phase, agent, instruction = STEPS[step]
                 name, role = people[index]
-                with self.lock:
+                with self.lock, self.db:
+                    self.check_stop()
+                    self.db.execute("UPDATE group_tasks SET status='running' WHERE id=?", (task_id,))
                     self.active = f"{name} · {phase}"
                     _, messages, _ = self.snapshot()
                 prompt = (f"You are {name}. Your role is {role}. Your teammate is {people[1 - index][0]}.\n"
                           f"Write one public reply in your own name. Use short sentences. {instruction}\n"
                           "The last Task is the user's current request. Use this shared chat history:\n"
                           + json.dumps(messages, ensure_ascii=False))
-                reply = run_turn(self.work, agent, prompt, lambda detail: self.post(name, "Tool", detail))
-                self.post(name, phase, reply)
+                options = {"deadline": deadline} if deadline is not None else {}
+                if row:
+                    options["spawn"] = self.spawn
+                reply = run_turn(self.work, agent, prompt, lambda detail: self.post(name, "Tool", detail), **options)
+                remaining(deadline)
+                self.save_step(task_id, step, name, phase, reply)
+                pending = self.pending()
+                if not pending:
+                    break
+                step = pending[2]
+        except TaskCancelled:
+            pass
         except Exception as exc:
-            self.post(name, "Stopped", str(exc))
-        finally:
             with self.lock:
+                if not self.stopping:
+                    if isinstance(exc, DeadlineExpired) or (deadline is not None and time.time() >= deadline):
+                        self.expire(task_id)
+                    else:
+                        self.post("Bot" if step == 4 else name, "Stopped", str(exc))
+        finally:
+            with self.lock, self.db:
+                if self.stopping:
+                    self.db.execute("UPDATE group_tasks SET status='cancelled' WHERE id=?", (task_id,))
+                    self.stopping = False
                 self.active = ""
