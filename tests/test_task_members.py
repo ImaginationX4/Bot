@@ -75,3 +75,60 @@ class TaskMembers(unittest.TestCase):
                 self.assertEqual(names, ["A","B","A","B"] * 2)
             finally:
                 room.db.close()
+
+    def test_planner_handoff(self):
+        self.check_planner_handoff(restart=False)
+
+    def test_planner_handoff_after_restart(self):
+        self.check_planner_handoff(restart=True)
+
+    def check_planner_handoff(self, restart):
+        with tempfile.TemporaryDirectory() as temp:
+            room = Room(Path(temp))
+            calls = []
+            plan = "PLAN-7C91: write handoff.txt"
+            feedback = "REVIEW-3D62: verify exact bytes"
+            def fake(work, agent, prompt, show_tool):
+                name = prompt.split(".")[0].removeprefix("You are ")
+                phase = room.active.split(" · ")[1]
+                calls.append((name, phase))
+                path = work / "handoff.txt"
+                if phase == "Proposal":
+                    return plan
+                if phase == "Reply":
+                    self.assertIn(plan, prompt)
+                    return feedback
+                if phase == "Work":
+                    self.assertIn(plan, prompt)
+                    self.assertIn(feedback, prompt)
+                    path.write_bytes(b"ready")
+                    return "Created handoff.txt"
+                return f"Read {path.name}: {path.read_bytes()!r}"
+
+            try:
+                room.create([("A","Planner"), ("B","Reviewer")])
+                room.add_member(("C","Executor"))
+                with patch("room.run_turn", fake), patch("room.Thread.start", lambda t: t.run()):
+                    options = dict(planner_id=1, executor_id=3, reviewer_id=2)
+                    if restart:
+                        save = room.save_step
+                        def checkpoint(*args):
+                            save(*args)
+                            raise SystemExit()
+                        with patch.object(room, "save_step", checkpoint), self.assertRaises(SystemExit):
+                            room.start("Write a handoff", **options)
+                        task_id, status, count = room.pending()
+                        self.assertEqual((status,count,calls), ("ready",1,[("A","Proposal")]))
+                        room.db.close()
+                        room = Room(Path(temp))
+                        self.assertEqual(room.pending()[0], task_id)
+                        room.resume(task_id)
+                    else:
+                        task_id = room.start("Write a handoff", **options)
+                self.assertEqual(calls, [("A","Proposal"),("B","Reply"),("C","Work"),("B","Final result")])
+                self.assertEqual(room.db.execute("SELECT planner_id,executor_id,reviewer_id FROM task_members WHERE task_id=?",
+                                                 (task_id,)).fetchone(), (1,3,2))
+                self.assertEqual(room.task_outputs(task_id)[-1], ("B","Final result","Read handoff.txt: b'ready'"))
+                self.assertEqual(room.db.execute("SELECT status FROM group_tasks WHERE id=?", (task_id,)).fetchone(), ("completed",))
+            finally:
+                room.db.close()

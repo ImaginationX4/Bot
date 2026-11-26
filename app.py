@@ -138,14 +138,16 @@ def chat():
             limit = None
         else:
             limit = st.number_input("Maximum rounds", min_value=1, value=3)
-    executor = reviewer = None
+    executor = reviewer = planner = None
     if not active and not pending and command is None:
         names = {i: name for i, name, _ in room.members()}
+        planner = st.selectbox("Planner (optional)", [None, *names],
+                               format_func=lambda i: "Use executor" if i is None else names[i])
         executor = st.selectbox("Executor", list(names), format_func=names.get)
         reviewer = st.selectbox("Reviewer", [i for i in names if i != executor], format_func=names.get)
     task = st.chat_input("Give the group a task", disabled=bool(active or pending))
     if task:
-        submit(lambda value: room.start(value, command, limit, total_seconds, executor_id=executor, reviewer_id=reviewer), task)
+        submit(lambda value: room.start(value, command, limit, total_seconds, executor_id=executor, reviewer_id=reviewer, planner_id=planner), task)
 
 
 chat()

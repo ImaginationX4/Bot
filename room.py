@@ -124,6 +124,8 @@ class Room:
             task_id INTEGER PRIMARY KEY, executor_id INTEGER NOT NULL, reviewer_id INTEGER NOT NULL)""")
         self.db.execute("CREATE TABLE IF NOT EXISTS messages (name TEXT, kind TEXT, body TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS group_tasks (id INTEGER PRIMARY KEY, status TEXT NOT NULL)")
+        if "planner_id" not in {row[1] for row in self.db.execute("PRAGMA table_info(task_members)")}:
+            self.db.execute("ALTER TABLE task_members ADD COLUMN planner_id INTEGER")
         self.db.execute("""CREATE TABLE IF NOT EXISTS group_steps (
             task_id INTEGER, step INTEGER, output_message INTEGER NOT NULL, PRIMARY KEY(task_id, step))""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS ralph_tasks (
@@ -198,13 +200,18 @@ class Room:
                 raise ValueError("Give each person a different name.")
             self.db.execute("INSERT INTO people(name,role) VALUES (?,?)", (name, role))
 
-    def task_pair(self, executor_id, reviewer_id):
+    def task_assignment(self, executor_id, reviewer_id, planner_id=None):
         members = {i: (name, role) for i, name, role in self.members()}
         if executor_id is None and reviewer_id is None:
             executor_id, reviewer_id = list(members)[:2]
         if executor_id == reviewer_id or executor_id not in members or reviewer_id not in members:
             raise ValueError("Choose two different group members.")
-        return (executor_id, reviewer_id), [members[executor_id], members[reviewer_id]]
+        if planner_id is not None and planner_id not in members:
+            raise ValueError("Choose an existing planner.")
+        assigned = [members[executor_id], members[reviewer_id]]
+        if planner_id is not None:
+            assigned.append(members[planner_id])
+        return (executor_id, reviewer_id, planner_id), assigned
 
     def post(self, name, kind, body):
         with self.lock, self.db:
@@ -234,7 +241,7 @@ class Room:
                 LEFT JOIN acceptance a ON a.task_id=t.id
                 WHERE t.id=(SELECT MAX(id) FROM group_tasks) ORDER BY a.round DESC LIMIT 1""").fetchone()
 
-    def start(self, task, command=None, max_rounds=3, total_seconds=3600, *, executor_id=None, reviewer_id=None, from_private=False):
+    def start(self, task, command=None, max_rounds=3, total_seconds=3600, *, executor_id=None, reviewer_id=None, from_private=False, planner_id=None):
         if command is not None and (not command.strip() or (max_rounds is not None and max_rounds < 1)):
             raise ValueError("Enter an acceptance command and at least one round.")
         if command is not None and total_seconds is not None and not (0 < total_seconds < float("inf")):
@@ -243,18 +250,20 @@ class Room:
             people, _, active = self.snapshot()
             if active or self.pending() or len(people) < 2 or not task.strip():
                 raise ValueError("Create the group and finish the current task before sending another.")
-            ids, pair = self.task_pair(executor_id, reviewer_id)
+            if planner_id is not None and (from_private or command is not None):
+                raise ValueError("Planner selection is available for ordinary group tasks.")
+            ids, assigned = self.task_assignment(executor_id, reviewer_id, planner_id)
             with self.db:
                 task_id = self.db.execute("INSERT INTO messages VALUES ('You','Task',?)", (task.strip(),)).lastrowid
                 self.db.execute("INSERT INTO group_tasks VALUES (?, 'ready')", (task_id,))
-                self.db.execute("INSERT INTO task_members VALUES (?,?,?)", (task_id, *ids))
+                self.db.execute("INSERT INTO task_members(task_id,executor_id,reviewer_id,planner_id) VALUES (?,?,?,?)", (task_id, *ids))
                 if from_private:
                     self.db.execute("INSERT INTO private_dispatch VALUES (?,?)", (task_id, ids[0]))
                 if command is not None:
                     deadline = None if total_seconds is None else time.time() + total_seconds
                     self.db.execute("INSERT INTO ralph_tasks(task_id,command,max_rounds,deadline) VALUES (?,?,?,?)",
                                     (task_id, command, max_rounds or 0, deadline))
-            self.launch(pair, task_id, 0)
+            self.launch(assigned, task_id, 0)
             return task_id
 
     def dispatched_tasks(self, agent_id):
@@ -276,10 +285,10 @@ class Room:
                 raise ValueError("This task is no longer waiting to resume.")
             if pending[1] == "running" and not retry:
                 raise ValueError("Check the work folder before retrying this step.")
-            ids = self.db.execute("SELECT executor_id,reviewer_id FROM task_members WHERE task_id=?",
+            ids = self.db.execute("SELECT executor_id,reviewer_id,planner_id FROM task_members WHERE task_id=?",
                                   (task_id,)).fetchone()
-            _, pair = self.task_pair(*(ids or (None, None)))
-            self.launch(pair, task_id, pending[2])
+            _, assigned = self.task_assignment(*(ids or (None, None)))
+            self.launch(assigned, task_id, pending[2])
 
     def launch(self, people, task_id, first):
         self.active = "Acceptance" if first == 4 else STEPS[first][1]
@@ -382,7 +391,13 @@ class Room:
                     step = pending[2]
                     continue
                 index, phase, agent, instruction = STEPS[step]
-                name, role = people[index]
+                if len(people) == 3:
+                    executor, reviewer, planner = people
+                    name, role = planner if step == 0 else people[index]
+                    team = f"Planner: {planner[0]}. Executor: {executor[0]}. Reviewer: {reviewer[0]}."
+                else:
+                    name, role = people[index]
+                    team = f"Your teammate is {people[1 - index][0]}."
                 with self.lock, self.db:
                     self.check_stop()
                     self.db.execute("UPDATE group_tasks SET status='running' WHERE id=?", (task_id,))
@@ -391,7 +406,7 @@ class Room:
                                             (task_id,)).fetchone()
                     messages = self.db.execute("SELECT name,kind,body FROM messages WHERE rowid>=? ORDER BY rowid",
                                                (start[0] if start else 0,)).fetchall()
-                prompt = (f"You are {name}. Your role is {role}. Your teammate is {people[1 - index][0]}.\n"
+                prompt = (f"You are {name}. Your role is {role}. {team}\n"
                           f"Write one public reply in your own name. Use short sentences. {instruction}\n"
                           "The last Task is the user's current request. Use this shared chat history:\n"
                           + json.dumps(messages, ensure_ascii=False))
